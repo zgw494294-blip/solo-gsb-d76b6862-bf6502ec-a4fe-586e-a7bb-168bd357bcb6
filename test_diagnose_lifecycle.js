@@ -37,8 +37,10 @@ class El {
     this._html = html;
     // 与真实 DOM 一致：写入 innerHTML 时解析为子节点，使 querySelector 能找到
     // 渲染出的按钮（同时保留原始 html 文本供字符串断言）。
+    // 注意必须先复制一份再逐个 appendChild：appendChild 会把节点从 parseHtml 的
+    // 根数组中移除，直接 forEach 原数组会隔位丢失顶层节点。
     this.children = [];
-    if (html) parseHtml(html).forEach((n) => this.appendChild(n));
+    if (html) [...parseHtml(html)].forEach((n) => this.appendChild(n));
   }
   get innerHTML() { return this._html; }
   appendChild(c) {
@@ -213,7 +215,7 @@ const diagnoseResult = {
 };
 
 const server = {
-  adjMode: "valid",       // valid | invalid | hold
+  adjMode: "valid",       // valid | invalid | neterr | hold
   diagMode: "valid",      // valid | invalid | neterr | hold
   adjHold: null,
   diagHold: null,
@@ -234,6 +236,7 @@ global.fetch = async (url, opts) => {
     if (server.adjMode === "invalid") {
       return respond({ ok: false, error: "模拟非法输入" }, false, 422);
     }
+    if (server.adjMode === "neterr") throw new TypeError("模拟裁决断网");
     if (server.adjMode === "hold") return respond(await server.adjHold, true, 200);
     return respond({ ok: true, result: adjudicateResult }, true, 200);
   }
@@ -298,7 +301,8 @@ async function setupValid() {
   setVal("smMin", "10"); setVal("smMax", "60");
   setVal("mfMin", "10"); setVal("mfMax", "60");
   runnerRows.querySelector(".runner-number").value = "101";
-  for (let i = 0; i < 7; i++) fire(addRecord, "click"); // 初始 2 空行 → 共 9 行
+  // 补足到 9 行记录（清空后只剩 1 行，初始为 2 行）。
+  while (recordRows.querySelectorAll(".record-row").length < 9) fire(addRecord, "click");
   const rows = [
     ["a1", "101", "S", "0"], ["b1", "101", "M", "12"], ["c1", "101", "F", "25"],
     ["a2", "101", "S", "30"], ["b2", "101", "M", "45"], ["c2", "101", "F", "57"],
@@ -306,6 +310,40 @@ async function setupValid() {
   ];
   for (const [i, r, g, t] of rows) setRow(i, r, g, t);
   await adjudicate();
+}
+
+// 通过真实的 resultsBox click 监听保存复核（与 test_review_lifecycle.js 同款假节点）。
+function saveReview(keyIndex, status, note) {
+  const box = new El("div");
+  box.classList.add("review-box");
+  box.dataset.keyIndex = String(keyIndex);
+  const radio = { value: status };
+  const noteEl = { value: note };
+  const errEl = { hidden: false, textContent: "" };
+  const current = { innerHTML: "" };
+  box.querySelector = (sel) => {
+    if (sel === "input[type=radio]:checked") return radio;
+    if (sel === ".review-note") return noteEl;
+    if (sel === ".review-error") return errEl;
+    if (sel === ".review-current") return current;
+    return undefined;
+  };
+  const btn = new El("button");
+  btn.classList.add("btn", "review-save");
+  box.appendChild(btn);
+  results.appendChild(box);
+  fire(btn, "click");
+  box.parent = null;
+  return current.innerHTML;
+}
+
+// 通过真实的 resultsBox click 监听保存罚秒。
+function savePenalty(runner, seconds, reason) {
+  const ed = results.querySelectorAll(".penalty-editor")
+    .find((e) => e.dataset.runner === String(runner));
+  ed.querySelector(".penalty-seconds").value = seconds;
+  ed.querySelector(".penalty-reason").value = reason;
+  fire(ed.querySelector(".penalty-save"), "click");
 }
 
 async function main() {
@@ -502,6 +540,183 @@ async function main() {
   assert(calls.diagnose[calls.diagnose.length - 1].runners[0].number === BIG,
     "诊断请求中的大编号以十进制字符串原样发送");
   server.diagRaw = null;
+
+  // 重算前发出的迟到诊断专用标记：若被错误应用，页面会出现 D1MARK。
+  const d1StaleResult = {
+    runners: [
+      {
+        runner: 101, lapCount: 0, totalTime: 0,
+        diagnoses: [{ id: "D1MARK", gate: "S", time: 1, classification: "unusable" }],
+      },
+    ],
+  };
+
+  console.log("场景12：输入未变的手动重算开始即清除旧诊断并禁止检查；复核与罚秒保留");
+  fire($("clear-btn"), "click");
+  await flush();
+  await setupValid();
+  clickDiag();
+  await flush();
+  assert(diagState().status === "done", "重算前诊断已完成");
+  // 保存一条复核与一笔罚秒：未改输入的重算成功后都应保留。
+  const reviewSaved = saveReview(0, "pass", "重算保留备注");
+  savePenalty(101, "5", "重算保留原因");
+  assert(reviewSaved.includes("当前：通过") && reviewSaved.includes("重算保留备注"),
+    "复核已保存");
+  assert(globalThis.__penaltiesForTest.get("101").seconds === 5, "罚秒已保存");
+  // 输入未变，直接点“裁决 / 重新计算”，裁决挂起。
+  let resolveAdj12;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj12 = res; });
+  fire(form, "submit");
+  await flush(2);
+  assert(diagnosisBox.hidden, "手动重算开始：诊断卡立即隐藏");
+  assert(diagState().status === "idle" && diagHtml() === "", "旧诊断内容已清除，状态重置 idle");
+  assert(diagnosisBox.querySelector(".diagnose-run") === undefined,
+    "重算等待期间没有检查按钮");
+  const diagCallsLocked = calls.diagnose.length;
+  globalThis.__runDiagnosisForTest(); // 等待期间即使绕过按钮直接调用也应被拦截
+  await flush();
+  assert(calls.diagnose.length === diagCallsLocked, "重算等待期间诊断请求被拦截，未发出");
+  // 最新合法裁决完成：恢复入口；复核、罚秒保留，名次按当前裁决恢复。
+  resolveAdj12({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  assert(!diagnosisBox.hidden && diagState().status === "idle",
+    "最新合法裁决完成后恢复可检查入口");
+  assert(diagHtml().includes("检查替代性"), "恢复后显示检查按钮");
+  assert(!diagHtml().includes("同优可替代"), "旧诊断结果未随重算恢复（需重新检查）");
+  assert(results.innerHTML.includes("当前：通过") &&
+    results.innerHTML.includes("重算保留备注"), "未改输入的重算后原复核仍保留");
+  assert(globalThis.__penaltiesForTest.get("101").seconds === 5 &&
+    results.innerHTML.includes("重算保留原因"), "未改输入的重算后原罚秒仍保留");
+  assert(results.innerHTML.includes("57 秒") && results.innerHTML.includes("第 1 名"),
+    "名次按当前裁决与已保存罚秒恢复（52+5=57）");
+
+  console.log("场景13：重算前发出的诊断迟到成功，无论何时结束都不得重新显示或覆盖新诊断");
+  // 第一轮：D1 在重算仍在途时迟到 → 直接丢弃，诊断卡保持隐藏。
+  let resolveD1a;
+  server.diagMode = "hold";
+  server.diagHold = new Promise((res) => { resolveD1a = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "D1 在途");
+  let resolveAdj13a;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj13a = res; });
+  fire(form, "submit");
+  await flush(2);
+  assert(diagnosisBox.hidden, "重算开始：在途 D1 被清除，诊断卡隐藏");
+  resolveD1a({ ok: true, result: d1StaleResult }); // D1 在重算在途期间迟到
+  await flush();
+  assert(diagnosisBox.hidden && diagState().status === "idle",
+    "D1 在重算在途期间迟到：不重新显示，状态保持清除");
+  resolveAdj13a({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  server.diagMode = "valid";
+  assert(!diagnosisBox.hidden && diagState().status === "idle", "重算完成后恢复 idle");
+  assert(!diagHtml().includes("D1MARK"), "D1 迟到结果未显示");
+  // 第二轮：D1 挂起 → 重算完成 → D2 已完成 → D1 迟到成功不得覆盖 D2。
+  let resolveD1b;
+  server.diagMode = "hold";
+  server.diagHold = new Promise((res) => { resolveD1b = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "第二轮 D1 在途");
+  let resolveAdj13b;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj13b = res; });
+  fire(form, "submit");
+  await flush(2);
+  resolveAdj13b({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  server.diagMode = "valid";
+  assert(diagState().status === "idle", "重算完成后恢复 idle");
+  clickDiag(); // D2 快速成功
+  await flush();
+  assert(diagState().status === "done" && diagHtml().includes("同优可替代"),
+    "D2 已完成并展示");
+  resolveD1b({ ok: true, result: d1StaleResult }); // D1 在 D2 完成后迟到
+  await flush();
+  assert(diagState().status === "done", "D1 迟到成功未改写 D2 的完成状态");
+  assert(diagHtml().includes("同优可替代") && !diagHtml().includes("D1MARK"),
+    "D1 迟到成功未覆盖 D2 的展示内容");
+
+  console.log("场景14：重算前诊断的迟到服务错误/网络失败不得显示，也不改写后续在途诊断");
+  // D1 挂起 → 重算 → 重算完成 → D2 在途 → D1 迟到 422 → D2 在途状态不变。
+  let resolveD1c;
+  server.diagMode = "hold";
+  server.diagHold = new Promise((res) => { resolveD1c = res; });
+  clickDiag(); // done 态“重新诊断”
+  assert(diagState().status === "loading", "D1 在途");
+  let resolveAdj14;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj14 = res; });
+  fire(form, "submit");
+  await flush(2);
+  resolveAdj14({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  assert(diagState().status === "idle", "重算完成后恢复 idle");
+  let resolveD2;
+  server.diagMode = "hold";
+  server.diagHold = new Promise((res) => { resolveD2 = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "D2 在途");
+  resolveD1c({ ok: false, error: "D1迟到服务错误" }); // D1 迟到服务错误
+  await flush();
+  assert(diagState().status === "loading", "D1 迟到服务错误未改写 D2 的在途状态");
+  assert(!diagHtml().includes("D1迟到服务错误"), "D1 迟到服务错误未显示");
+  resolveD2({ ok: true, result: diagnoseResult });
+  await flush();
+  assert(diagState().status === "done" && diagHtml().includes("同优可替代"),
+    "D2 正常完成并展示");
+  server.diagMode = "valid";
+  // 再来一轮：D1 挂起 → 重算完成 → D1 迟到网络失败 → 不显示错误，入口保持 idle。
+  let resolveD1d;
+  server.diagMode = "hold";
+  server.diagHold = new Promise((res) => { resolveD1d = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "第三轮 D1 在途");
+  let resolveAdj14b;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj14b = res; });
+  fire(form, "submit");
+  await flush(2);
+  resolveAdj14b({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  resolveD1d(Promise.reject(new TypeError("D1迟到断网"))); // D1 迟到网络失败
+  await flush();
+  assert(diagState().status === "idle" && !diagnosisBox.hidden,
+    "D1 迟到网络失败未显示错误，入口保持 idle");
+  assert(!diagHtml().includes("无法连接诊断服务"), "迟到网络失败未在诊断卡报错");
+  server.diagMode = "valid";
+
+  console.log("场景15：手动重算失败保持不可检查，重新裁决成功后恢复");
+  server.adjMode = "invalid";
+  fire(form, "submit");
+  await flush();
+  assert(diagnosisBox.hidden && diagState().status === "idle",
+    "重算失败（422）后诊断卡保持隐藏，不可检查");
+  assert(!$("error-box").hidden, "裁决错误正常显示");
+  const diagCallsFailed = calls.diagnose.length;
+  globalThis.__runDiagnosisForTest();
+  await flush();
+  assert(calls.diagnose.length === diagCallsFailed, "失败后不可发诊断");
+  server.adjMode = "neterr";
+  fire(form, "submit");
+  await flush();
+  assert(diagnosisBox.hidden, "重算网络失败后诊断卡保持隐藏");
+  server.adjMode = "valid";
+  fire(form, "submit");
+  await flush();
+  assert(!diagnosisBox.hidden && diagState().status === "idle",
+    "重新裁决成功后恢复可检查入口");
+  clickDiag();
+  await flush();
+  assert(diagState().status === "done" && diagHtml().includes("同优可替代"),
+    "恢复后可正常诊断");
 
   console.log(failures === 0 ? "\nALL DIAGNOSIS SCENARIOS PASSED" : `\n${failures} ASSERTION(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

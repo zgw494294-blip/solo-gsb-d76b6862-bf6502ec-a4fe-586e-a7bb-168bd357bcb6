@@ -191,6 +191,14 @@ function clearOutcome() {
 // 诊断不写入裁决结果区：只渲染独立的 #diagnosis-box；输入一改（clearOutcome）即隐藏并
 // 重置；inputVersion 守卫保证迟到的成功或失败都不会覆盖更新状态。
 let diagnosisState = { status: "idle" };
+// 诊断世代号：每次清除诊断（输入变更、清空，以及每一次裁决开始——含输入未变的
+// 手动重算）都递增。重算前发出的诊断无论何时结束，世代号都已过期：其迟到的成功、
+// 服务错误或网络失败一律丢弃，不得重新显示，也不得改写后续诊断的在途/成功/失败状态。
+let diagnosisEpoch = 0;
+// 裁决在途计数：每次裁决开始（输入变更后的自动重算与手动重算）加一，响应落地
+// （无论成败、是否过期）减一。计数大于零期间诊断一律不可检查；只有最新合法裁决
+// 完成（renderResults → resetDiagnosis）才恢复入口，裁决失败时保持不可检查。
+let adjudicationsInFlight = 0;
 // 仅供无浏览器生命周期测试直接读取/驱动诊断状态。
 if (typeof globalThis !== "undefined") {
   globalThis.__getDiagnosisStateForTest = () => diagnosisState;
@@ -414,6 +422,11 @@ function normalizeResult(result) {
 
 async function runAdjudication() {
   const version = inputVersion;
+  // 每次裁决开始（含输入未变的手动重算）即清除旧诊断并禁止检查：
+  // 在途计数锁定入口，此前发出的诊断由世代号守卫作废；
+  // 只有最新合法裁决完成才由 renderResults → resetDiagnosis 恢复入口。
+  adjudicationsInFlight += 1;
+  clearDiagnosis();
   let resp;
   let data;
   try {
@@ -425,6 +438,7 @@ async function runAdjudication() {
     // 用无损解析代替 resp.json()：大整数编号不会被浮点精度截断。
     data = parseJsonLossless(await resp.text());
   } catch (err) {
+    adjudicationsInFlight -= 1;
     if (version !== inputVersion) return; // 过期的失败不得覆盖较新状态
     pendingHint.hidden = true;
     resultsBox.innerHTML = "";
@@ -432,6 +446,7 @@ async function runAdjudication() {
     showError(`无法连接裁决服务：${err.message}`);
     return;
   }
+  adjudicationsInFlight -= 1;
   if (version !== inputVersion) return; // 过期的成功同样丢弃
   pendingHint.hidden = true;
   if (!resp.ok || !data.ok) {
@@ -453,8 +468,8 @@ form.addEventListener("submit", (e) => {
     debounceTimer = null;
   }
   pendingHint.hidden = false;
-  // 重算期间诊断不可用：按新一次重算重置（旧诊断响应由版本守卫丢弃）。
-  resetDiagnosis();
+  // 每次裁决开始（含输入未变的手动重算）由 runAdjudication 清除旧诊断并禁止检查；
+  // 重算前发出的诊断由世代号守卫丢弃，最新合法裁决完成才恢复检查入口。
   runAdjudication();
 });
 
@@ -948,6 +963,8 @@ const DIAG_HINTS = {
 };
 
 function clearDiagnosis() {
+  // 世代号递增：此前发出的诊断无论何时结束都一律作废（迟到响应不得再显示）。
+  diagnosisEpoch += 1;
   diagnosisState = { status: "idle" };
   diagnosisBox.hidden = true;
   diagnosisBox.innerHTML = "";
@@ -984,8 +1001,11 @@ function normalizeDiagnosis(result) {
 
 async function runDiagnosis() {
   // 重算在途、无合法结果、已有诊断在途时都不可检查。
-  if (diagnosisState.status === "loading" || !latestResult) return;
+  if (diagnosisState.status === "loading" || !latestResult || adjudicationsInFlight > 0) {
+    return;
+  }
   const version = inputVersion;
+  const epoch = diagnosisEpoch;
   diagnosisState = { status: "loading" };
   paintDiagnosis();
 
@@ -1000,13 +1020,15 @@ async function runDiagnosis() {
     });
     data = parseJsonLossless(await resp.text());
   } catch (err) {
-    // 迟到的失败不得覆盖较新输入的状态。
-    if (version !== inputVersion) return;
+    // 迟到的失败（输入已变、已清空或重算已开始）不得覆盖较新状态。
+    if (version !== inputVersion || epoch !== diagnosisEpoch) return;
     diagnosisState = { status: "error", message: `无法连接诊断服务：${err.message}` };
     paintDiagnosis();
     return;
   }
-  if (version !== inputVersion) return; // 迟到的成功同样丢弃
+  // 迟到的成功同样丢弃：重算前发出的诊断无论何时结束都不得重新显示，
+  // 也不得改写后续诊断的在途/成功/失败状态。
+  if (version !== inputVersion || epoch !== diagnosisEpoch) return;
   if (!resp.ok || !data.ok) {
     // 当前输入本应与已展示的合法裁决一致；服务报错只在诊断卡内呈现，不动采纳结果。
     diagnosisState = {
@@ -1146,8 +1168,8 @@ function diagnosisDoneHtml(result) {
 }
 
 function paintDiagnosis() {
-  // 无合法结果时（重算中、非法、清空）诊断卡整体隐藏，不可检查。
-  if (!latestResult) {
+  // 无合法结果或裁决在途（含输入未变的手动重算）时诊断卡整体隐藏，不可检查。
+  if (!latestResult || adjudicationsInFlight > 0) {
     diagnosisBox.hidden = true;
     return;
   }
@@ -1174,7 +1196,9 @@ diagnosisBox.addEventListener("click", (e) => {
       !e.target.classList.contains("diagnose-rerun")) {
     return;
   }
-  if (diagnosisState.status === "loading" || !latestResult) return;
+  if (diagnosisState.status === "loading" || !latestResult || adjudicationsInFlight > 0) {
+    return;
+  }
   runDiagnosis();
 });
 
