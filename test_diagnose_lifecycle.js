@@ -116,7 +116,14 @@ function parseHtml(html) {
     const selfClose = t.endsWith("/>");
     const nameM = t.match(/^<\/?([\w-]+)/);
     const tag = nameM[1].toLowerCase();
-    if (closing) { stack.pop(); continue; }
+    if (closing) {
+      // 保留原始 innerHTML 字符串（含文本），便于测试直接断言内容（如名次表槽位）。
+      const el = stack.pop();
+      if (el && el._contentStart !== undefined) {
+        el._html = html.slice(el._contentStart, tok.index);
+      }
+      continue;
+    }
     const el = new El(tag);
     const attrRe = /([\w:-]+)(?:\s*=\s*"([^"]*)")?/g;
     const raw = t.replace(/^<\/?[\w-]+/, "").replace(/\/?>$/, "");
@@ -128,7 +135,12 @@ function parseHtml(html) {
       el.attrs[k] = v;
       if (k === "class") v.split(/\s+/).forEach((c) => c && el.classList.add(c));
       else if (k === "id") el.id = v;
-      else if (k.startsWith("data-")) el.dataset[k.slice(5)] = v;
+      else if (k.startsWith("data-")) {
+        // 与真实 DOM 一致：data-key-index 同时映射为 dataset.keyIndex。
+        const dk = k.slice(5);
+        el.dataset[dk] = v;
+        el.dataset[dk.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
+      }
       else if (k === "value") el.value = v;
       else if (k === "checked") el.checked = true;
       else if (k === "hidden") el.hidden = true;
@@ -136,9 +148,15 @@ function parseHtml(html) {
       else if (k === "type") el.type = v;
     }
     stack[stack.length - 1].appendChild(el);
-    if (!selfClose && !VOID_TAGS.has(tag)) stack.push(el);
+    if (!selfClose && !VOID_TAGS.has(tag)) {
+      el._contentStart = tok.index + t.length;
+      stack.push(el);
+    }
   }
-  return root.children;
+  // 返回副本：调用方在 forEach 中 appendChild 会把节点从 root.children 就地 splice
+  // 移除，若直接返回该数组，遍历时每隔一个顶层兄弟节点被跳过（done 态诊断卡的
+  // “重新诊断”按钮所在 div 会因此丢失）。
+  return root.children.slice();
 }
 
 /* ---------------- document stub ---------------- */
@@ -213,7 +231,7 @@ const diagnoseResult = {
 };
 
 const server = {
-  adjMode: "valid",       // valid | invalid | hold
+  adjMode: "valid",       // valid | invalid | neterr | hold
   diagMode: "valid",      // valid | invalid | neterr | hold
   adjHold: null,
   diagHold: null,
@@ -231,6 +249,7 @@ global.fetch = async (url, opts) => {
   if (url === "/api/adjudicate") {
     calls.adjudicate += 1;
     JSON.parse(opts.body);
+    if (server.adjMode === "neterr") throw new TypeError("模拟断网");
     if (server.adjMode === "invalid") {
       return respond({ ok: false, error: "模拟非法输入" }, false, 422);
     }
@@ -294,11 +313,12 @@ function clickDiag() {
 }
 async function adjudicate() { fire(form, "submit"); await flush(); }
 
-async function setupValid() {
+async function setupValid(extraRecordRows = 7) {
   setVal("smMin", "10"); setVal("smMax", "60");
   setVal("mfMin", "10"); setVal("mfMax", "60");
   runnerRows.querySelector(".runner-number").value = "101";
-  for (let i = 0; i < 7; i++) fire(addRecord, "click"); // 初始 2 空行 → 共 9 行
+  // 初始页面有 2 空行（需补 7 行）；“清空”后只有 1 空行（需补 8 行），共 9 行。
+  for (let i = 0; i < extraRecordRows; i++) fire(addRecord, "click");
   const rows = [
     ["a1", "101", "S", "0"], ["b1", "101", "M", "12"], ["c1", "101", "F", "25"],
     ["a2", "101", "S", "30"], ["b2", "101", "M", "45"], ["c2", "101", "F", "57"],
@@ -306,6 +326,34 @@ async function setupValid() {
   ];
   for (const [i, r, g, t] of rows) setRow(i, r, g, t);
   await adjudicate();
+}
+
+// 名次表槽位的实时 HTML（罚秒保存后会被原地重排，results 整体 html 串不会随之更新）。
+const slotHtml = () => results.querySelector(".ranking-table-slot").innerHTML;
+
+// 通过真实渲染的复核框保存复核（stub 的 parseHtml 已与真实 DOM 一致：
+// data-key-index 自动映射为 dataset.keyIndex）。
+function saveReviewUi(keyIndex, status, note) {
+  const box = results.querySelectorAll(".review-box")
+    .find((b) => b.dataset.keyIndex === String(keyIndex));
+  assert(box, `第 ${keyIndex + 1} 趟的复核框存在`);
+  for (const r of box.querySelectorAll('input[type="radio"]')) {
+    r.checked = r.value === status;
+  }
+  box.querySelector(".review-note").value = note;
+  fire(box.querySelector(".review-save"), "click");
+  return box.querySelector(".review-current").innerHTML;
+}
+
+// 通过真实渲染的罚秒编辑区保存罚秒。
+function savePenaltyUi(runner, seconds, reason) {
+  const ed = results.querySelectorAll(".penalty-editor")
+    .find((e) => e.dataset.runner === String(runner));
+  assert(ed, `选手 ${runner} 的罚秒编辑区存在`);
+  ed.querySelector(".penalty-seconds").value = seconds;
+  ed.querySelector(".penalty-reason").value = reason;
+  fire(ed.querySelector(".penalty-save"), "click");
+  return ed.querySelector(".penalty-current").innerHTML;
 }
 
 async function main() {
@@ -502,6 +550,134 @@ async function main() {
   assert(calls.diagnose[calls.diagnose.length - 1].runners[0].number === BIG,
     "诊断请求中的大编号以十进制字符串原样发送");
   server.diagRaw = null;
+
+  console.log("场景12：输入未变的手动重算——开始即清除旧诊断并禁止检查，完成后恢复入口");
+  fire($("clear-btn"), "click");
+  await flush();
+  await setupValid(8); // 清空后只剩 1 空记录行，补 8 行共 9 行
+  clickDiag();
+  await flush();
+  assert(diagState().status === "done", "前置：诊断已完成");
+  // 手动重算（输入未变），裁决响应挂起以模拟等待期间
+  let resolveAdj;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj = res; });
+  const diagCallsBeforeRecompute = calls.diagnose.length;
+  fire(form, "submit");
+  assert(diagnosisBox.hidden, "重算开始：诊断卡立即隐藏（禁止检查）");
+  assert(diagState().status === "idle" && diagHtml() === "", "重算开始：旧诊断状态与内容已清除");
+  assert(diagnosisBox.querySelector(".diagnose-run") === undefined, "重算期间没有检查按钮");
+  globalThis.__runDiagnosisForTest(); // 即使绕过界面尝试发诊断也被拦截
+  await flush();
+  assert(calls.diagnose.length === diagCallsBeforeRecompute, "重算期间不会发出诊断请求");
+  assert(results.innerHTML.includes("a2"), "重算等待期间原采纳结果仍展示（未被清空）");
+  // 最新合法裁决完成 → 入口恢复
+  resolveAdj({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  assert(!diagnosisBox.hidden && diagState().status === "idle",
+    "最新合法裁决完成后恢复可检查入口");
+  assert(diagHtml().includes("检查替代性"), "恢复后显示检查按钮");
+  assert(!diagHtml().includes("同优可替代"), "旧诊断内容未随重算恢复");
+
+  console.log("场景13：重算前发出的诊断 D1 迟到（成功/服务错误/断网）不得覆盖重算后的诊断状态");
+  // 13a：D1 挂起 → 手动重算 → D2 完成 → D1 迟到成功被丢弃
+  server.diagMode = "hold";
+  let resolveD1;
+  server.diagHold = new Promise((res) => { resolveD1 = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "D1 在途（loading）");
+  fire(form, "submit"); // 输入未变的手动重算：D1 即刻作废
+  await flush();
+  assert(diagState().status === "idle", "重算后诊断回到 idle（D1 在途状态被清除）");
+  server.diagMode = "valid";
+  clickDiag(); // D2
+  await flush();
+  assert(diagState().status === "done", "D2 完成");
+  const d2Html = diagHtml();
+  // D1 迟到的成功（带独特标记 D1LATE，若覆盖则能观察到）
+  resolveD1({ ok: true, result: { runners: [{ runner: 101, lapCount: 2, totalTime: 52,
+    diagnoses: [{ id: "D1LATE", gate: "S", time: 1, classification: "unusable" }] }] } });
+  await flush();
+  assert(diagState().status === "done", "D1 迟到成功未改变 D2 的完成状态");
+  assert(diagHtml() === d2Html, "D1 迟到成功未改写 D2 的展示内容");
+  assert(!diagHtml().includes("D1LATE"), "D1 的结果没有重新显示");
+  // 13b：D1 挂起 → 手动重算 → D1 迟到服务错误不得显示
+  server.diagMode = "hold";
+  let resolveD1b;
+  server.diagHold = new Promise((res) => { resolveD1b = res; });
+  clickDiag(); // done 态“重新诊断”
+  assert(diagState().status === "loading", "D1' 在途（loading）");
+  fire(form, "submit");
+  await flush();
+  assert(diagState().status === "idle", "重算后回到 idle");
+  resolveD1b({ ok: false, error: "D1迟到服务错误" });
+  await flush();
+  assert(diagState().status === "idle", "D1' 迟到的服务错误未显示（保持 idle）");
+  assert(!diagHtml().includes("D1迟到服务错误"), "服务错误内容未出现");
+  assert(diagHtml().includes("检查替代性"), "仍是可检查的初始态");
+  // 13c：D1 挂起 → 手动重算 → D1 迟到网络失败不得显示
+  server.diagMode = "hold";
+  let resolveD1c;
+  server.diagHold = new Promise((res) => { resolveD1c = res; });
+  clickDiag();
+  assert(diagState().status === "loading", "D1'' 在途（loading）");
+  fire(form, "submit");
+  await flush();
+  resolveD1c(Promise.reject(new TypeError("D1迟到断网")));
+  await flush();
+  assert(diagState().status === "idle", "D1'' 迟到断网未显示错误");
+  assert(!diagHtml().includes("无法连接诊断服务"), "断网错误未出现");
+  server.diagMode = "valid";
+
+  console.log("场景14：手动重算失败（非法/断网）时保持不可检查，旧诊断不恢复");
+  clickDiag();
+  await flush();
+  assert(diagState().status === "done", "前置：诊断完成");
+  server.adjMode = "invalid";
+  fire(form, "submit");
+  await flush();
+  assert(!$("error-box").hidden, "重算 422：错误框显示");
+  assert(diagnosisBox.hidden && diagHtml() === "", "重算 422：诊断卡保持隐藏，旧诊断不恢复");
+  assert(diagnosisBox.querySelector(".diagnose-run") === undefined, "422 后没有检查按钮");
+  const diagCallsAtFail = calls.diagnose.length;
+  globalThis.__runDiagnosisForTest();
+  await flush();
+  assert(calls.diagnose.length === diagCallsAtFail, "裁决失败期间不会发出诊断请求");
+  server.adjMode = "neterr";
+  fire(form, "submit");
+  await flush();
+  assert(diagnosisBox.hidden && diagnosisBox.querySelector(".diagnose-run") === undefined,
+    "重算断网：诊断卡保持隐藏，不可检查");
+  server.adjMode = "valid";
+  fire(form, "submit");
+  await flush();
+  assert(!diagnosisBox.hidden && diagState().status === "idle", "重新裁决成功后恢复可检查入口");
+
+  console.log("场景15：未改输入的手动重算成功后，复核与罚秒保留、名次按当前裁决恢复，诊断只读");
+  const reviewCur = saveReviewUi(0, "pass", "重算保留复核");
+  assert(reviewCur.includes("当前：通过") && reviewCur.includes("重算保留复核"), "复核已保存并回显");
+  const penaltyCur = savePenaltyUi(101, "3", "设备故障");
+  assert(penaltyCur.includes("当前已保存：3 秒"), "罚秒已保存并回显");
+  assert(slotHtml().includes("<td>3 秒</td><td>55 秒</td>"), "名次表立即套用罚秒（52+3=55）");
+  let resolveAdj2;
+  server.adjMode = "hold";
+  server.adjHold = new Promise((res) => { resolveAdj2 = res; });
+  fire(form, "submit"); // 输入未变的手动重算
+  assert(diagnosisBox.hidden, "重算期间诊断不可检查");
+  resolveAdj2({ ok: true, result: adjudicateResult });
+  await flush();
+  server.adjMode = "valid";
+  assert(results.innerHTML.includes("重算保留复核") && results.innerHTML.includes("当前：通过"),
+    "重算成功后原复核保留");
+  assert(results.innerHTML.includes("当前已保存：3 秒"), "重算成功后原罚秒保留");
+  assert(slotHtml().includes("<td>3 秒</td><td>55 秒</td>"), "名次按当前裁决与已存罚秒恢复");
+  assert(!diagnosisBox.hidden && diagState().status === "idle", "诊断入口恢复为可检查");
+  const resultsSnapshot = results.innerHTML;
+  clickDiag();
+  await flush();
+  assert(diagState().status === "done", "诊断可重新检查并完成");
+  assert(results.innerHTML === resultsSnapshot, "诊断只读：复核、罚秒与名次不受影响");
 
   console.log(failures === 0 ? "\nALL DIAGNOSIS SCENARIOS PASSED" : `\n${failures} ASSERTION(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

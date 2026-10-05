@@ -169,6 +169,10 @@ recordRows.addEventListener("click", (e) => {
 // 每次修改递增版本号：只有版本仍最新的响应才允许更新结果或错误，
 // 过期的成功与失败一律丢弃，不得覆盖较新状态。
 let inputVersion = 0;
+// 裁决序号：每次发起裁决（防抖自动重算或手动点击“裁决 / 重新计算”）递增。
+// 输入未变的手动重算不会改变版本号，但同样是新一次裁决：只有序号仍最新的
+// 裁决响应才允许更新界面并恢复诊断入口；序号变化前发出的诊断响应一律作废。
+let adjudicationSeq = 0;
 let debounceTimer = null;
 const DEBOUNCE_MS = 350; // 合并连续编辑为一次重算
 
@@ -178,7 +182,7 @@ function clearOutcome() {
   errorBox.hidden = true;
   renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
   latestResult = null; // 名次表随之隐藏，等待最新合法结果
-  clearDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
+  closeDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
 }
 
 /* ---------- 未采纳记录替代性诊断（HTTP 只读分析，不改变采纳/复核/罚秒/名次） ---------- */
@@ -188,9 +192,14 @@ function clearOutcome() {
 //   loading  诊断请求在途：禁用按钮，不再发起新诊断
 //   done     诊断成功并展示（可能含各档分类与同优替代方案）
 //   error    诊断请求失败（服务报错或无法连接），可重试
-// 诊断不写入裁决结果区：只渲染独立的 #diagnosis-box；输入一改（clearOutcome）即隐藏并
-// 重置；inputVersion 守卫保证迟到的成功或失败都不会覆盖更新状态。
+// 诊断不写入裁决结果区：只渲染独立的 #diagnosis-box。
+// 入口开关（diagnosisOpen）：仅“最新一次裁决已完成且合法”时打开；
+// 每次裁决开始（含输入未变的手动重算）立即关闭并清除旧诊断，裁决失败保持关闭；
+// 输入变更/清空同样关闭。inputVersion 与 adjudicationSeq 双重守卫保证：
+// 重算前发出的诊断无论何时结束（成功、服务报错或断网）都不会重新显示结果或错误，
+// 也不会改写重算后新诊断的在途、成功、失败状态。
 let diagnosisState = { status: "idle" };
+let diagnosisOpen = false;
 // 仅供无浏览器生命周期测试直接读取/驱动诊断状态。
 if (typeof globalThis !== "undefined") {
   globalThis.__getDiagnosisStateForTest = () => diagnosisState;
@@ -414,6 +423,10 @@ function normalizeResult(result) {
 
 async function runAdjudication() {
   const version = inputVersion;
+  const seq = ++adjudicationSeq;
+  // 每次裁决开始（含输入未变的手动重算）：立即清除旧诊断并禁止检查；
+  // 只有本次（最新）合法裁决完成才由 renderResults 恢复入口，裁决失败保持不可检查。
+  closeDiagnosis();
   let resp;
   let data;
   try {
@@ -425,14 +438,14 @@ async function runAdjudication() {
     // 用无损解析代替 resp.json()：大整数编号不会被浮点精度截断。
     data = parseJsonLossless(await resp.text());
   } catch (err) {
-    if (version !== inputVersion) return; // 过期的失败不得覆盖较新状态
+    if (version !== inputVersion || seq !== adjudicationSeq) return; // 过期的失败不得覆盖较新状态
     pendingHint.hidden = true;
     resultsBox.innerHTML = "";
     latestResult = null;
     showError(`无法连接裁决服务：${err.message}`);
     return;
   }
-  if (version !== inputVersion) return; // 过期的成功同样丢弃
+  if (version !== inputVersion || seq !== adjudicationSeq) return; // 过期的成功同样丢弃
   pendingHint.hidden = true;
   if (!resp.ok || !data.ok) {
     // 非法输入：清空结果区，只显示错误（不展示部分结果）。
@@ -446,6 +459,8 @@ async function runAdjudication() {
 }
 
 // 手动裁决按钮仍然可用：跳过防抖立即重算，等待期间不锁定任何输入。
+// 输入未变的手动重算同样是新一次裁决：runAdjudication 内会立即清除旧诊断
+// 并禁止检查，只有最新合法裁决完成才恢复诊断入口。
 form.addEventListener("submit", (e) => {
   e.preventDefault();
   if (debounceTimer) {
@@ -453,8 +468,6 @@ form.addEventListener("submit", (e) => {
     debounceTimer = null;
   }
   pendingHint.hidden = false;
-  // 重算期间诊断不可用：按新一次重算重置（旧诊断响应由版本守卫丢弃）。
-  resetDiagnosis();
   runAdjudication();
 });
 
@@ -930,8 +943,9 @@ function renderResults(result) {
     .join("");
   // 名次表排在最前，使用渲染这一刻已保存的罚秒。
   resultsBox.innerHTML = rankingCardHtml(result) + runnerCards;
-  // 新的合法裁决到达：诊断恢复为可检查的初始态（旧输入的诊断已在 clearOutcome 清除）。
-  resetDiagnosis();
+  // 最新合法裁决到达：诊断入口恢复为可检查的初始态
+  // （每次裁决开始时已在 runAdjudication 清除旧诊断并关闭入口）。
+  openDiagnosis();
 }
 
 /* ---------- 替代性诊断 ---------- */
@@ -953,8 +967,15 @@ function clearDiagnosis() {
   diagnosisBox.innerHTML = "";
 }
 
-// 合法裁决结果到达后进入可检查状态（卡片显示、按钮可点）。
-function resetDiagnosis() {
+// 每次裁决开始（含输入未变的手动重算）与输入变更/清空：清除旧诊断并关闭检查入口。
+function closeDiagnosis() {
+  diagnosisOpen = false;
+  clearDiagnosis();
+}
+
+// 最新合法裁决到达后进入可检查状态（卡片显示、按钮可点，入口重新打开）。
+function openDiagnosis() {
+  diagnosisOpen = true;
   diagnosisState = { status: "idle" };
   paintDiagnosis();
 }
@@ -983,9 +1004,10 @@ function normalizeDiagnosis(result) {
 }
 
 async function runDiagnosis() {
-  // 重算在途、无合法结果、已有诊断在途时都不可检查。
-  if (diagnosisState.status === "loading" || !latestResult) return;
+  // 入口关闭（重算在途、非法、清空）、无合法结果、已有诊断在途时都不可检查。
+  if (!diagnosisOpen || diagnosisState.status === "loading" || !latestResult) return;
   const version = inputVersion;
+  const adjSeq = adjudicationSeq; // 重算一开始（序号递增），本次诊断的响应即作废
   diagnosisState = { status: "loading" };
   paintDiagnosis();
 
@@ -1000,13 +1022,15 @@ async function runDiagnosis() {
     });
     data = parseJsonLossless(await resp.text());
   } catch (err) {
-    // 迟到的失败不得覆盖较新输入的状态。
-    if (version !== inputVersion) return;
+    // 迟到的失败不得覆盖较新状态（含重算后新诊断的在途/成功/失败状态）。
+    if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
     diagnosisState = { status: "error", message: `无法连接诊断服务：${err.message}` };
     paintDiagnosis();
     return;
   }
-  if (version !== inputVersion) return; // 迟到的成功同样丢弃
+  // 迟到的成功同样丢弃：重算前发出的诊断无论何时结束都不得重新显示，
+  // 也不得改写重算后新诊断的在途、成功、失败状态。
+  if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
   if (!resp.ok || !data.ok) {
     // 当前输入本应与已展示的合法裁决一致；服务报错只在诊断卡内呈现，不动采纳结果。
     diagnosisState = {
@@ -1044,7 +1068,7 @@ function diagnosisIdleHtml() {
     </p>
     <div class="diag-actions">
       <button type="button" class="btn primary diagnose-run">🔎 检查替代性</button>
-      <span class="diag-action-hint">仅在当前输入合法且未在重算时可检查；输入一改即清除本诊断。</span>
+      <span class="diag-action-hint">仅在当前输入合法且未在重算时可检查；输入一改或重新计算即清除本诊断。</span>
     </div>`;
 }
 
@@ -1141,13 +1165,13 @@ function diagnosisDoneHtml(result) {
     ${result.runners.map(diagnosisRunnerHtml).join("")}
     <div class="diag-actions">
       <button type="button" class="btn ghost diagnose-rerun">重新诊断</button>
-      <span class="diag-action-hint">修改任意输入后本诊断立即清除，需在新结果上重新检查。</span>
+      <span class="diag-action-hint">修改任意输入或点击重新计算后本诊断立即清除，需在新结果上重新检查。</span>
     </div>`;
 }
 
 function paintDiagnosis() {
-  // 无合法结果时（重算中、非法、清空）诊断卡整体隐藏，不可检查。
-  if (!latestResult) {
+  // 入口关闭（重算在途、非法、清空）或无合法结果时诊断卡整体隐藏，不可检查。
+  if (!diagnosisOpen || !latestResult) {
     diagnosisBox.hidden = true;
     return;
   }
@@ -1168,13 +1192,14 @@ function paintDiagnosis() {
   diagnosisBox.hidden = false;
 }
 
-// 诊断按钮事件委托：loading 态按钮不存在/禁用，非法或重算期间卡片隐藏，皆不可点。
+// 诊断按钮事件委托：loading 态按钮不存在/禁用，入口关闭（重算在途、非法、清空）时
+// 卡片隐藏，皆不可点。
 diagnosisBox.addEventListener("click", (e) => {
   if (!e.target.classList.contains("diagnose-run") &&
       !e.target.classList.contains("diagnose-rerun")) {
     return;
   }
-  if (diagnosisState.status === "loading" || !latestResult) return;
+  if (!diagnosisOpen || diagnosisState.status === "loading" || !latestResult) return;
   runDiagnosis();
 });
 
